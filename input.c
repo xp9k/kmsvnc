@@ -3,11 +3,44 @@
 #include <linux/uinput.h>
 #include <math.h>
 #include <stdlib.h>
+#include <pthread.h>
 
 #include "input.h"
 #include "keymap.h"
 
 extern struct kmsvnc_data *kmsvnc;
+static pthread_mutex_t input_lock = PTHREAD_MUTEX_INITIALIZER;
+
+struct input_client_state {
+    char keys[UINPUT_MAX_KEY];
+    int buttons;
+};
+
+static int client_key_held(rfbScreenInfoPtr screen, int key)
+{
+    int held = 0;
+    rfbClientIteratorPtr iterator = rfbGetClientIterator(screen);
+    rfbClientPtr other;
+    while ((other = rfbClientIteratorNext(iterator))) {
+        struct input_client_state *state = other->clientData;
+        if (state && state->keys[key]) { held = 1; break; }
+    }
+    rfbReleaseClientIterator(iterator);
+    return held;
+}
+
+static int client_buttons(rfbScreenInfoPtr screen)
+{
+    int buttons = 0;
+    rfbClientIteratorPtr iterator = rfbGetClientIterator(screen);
+    rfbClientPtr other;
+    while ((other = rfbClientIteratorNext(iterator))) {
+        struct input_client_state *state = other->clientData;
+        if (state) buttons |= state->buttons;
+    }
+    rfbReleaseClientIterator(iterator);
+    return buttons;
+}
 
 void uinput_cleanup()
 {
@@ -50,15 +83,12 @@ int uinput_init()
     INP_IOCTL_MUST(inp->uinput_fd, UI_SET_ABSBIT, ABS_X);
     INP_IOCTL_MUST(inp->uinput_fd, UI_SET_ABSBIT, ABS_Y);
 
-    INP_IOCTL_MUST(inp->uinput_fd, UI_SET_EVBIT, EV_REL);
-    INP_IOCTL_MUST(inp->uinput_fd, UI_SET_RELBIT, REL_X);
-    INP_IOCTL_MUST(inp->uinput_fd, UI_SET_RELBIT, REL_Y);
-
     INP_IOCTL_MUST(inp->uinput_fd, UI_SET_KEYBIT, BTN_LEFT);
     INP_IOCTL_MUST(inp->uinput_fd, UI_SET_KEYBIT, BTN_MIDDLE);
     INP_IOCTL_MUST(inp->uinput_fd, UI_SET_KEYBIT, BTN_RIGHT);
     INP_IOCTL_MUST(inp->uinput_fd, UI_SET_EVBIT, EV_REL);
     INP_IOCTL_MUST(inp->uinput_fd, UI_SET_RELBIT, REL_WHEEL);
+    INP_IOCTL_MUST(inp->uinput_fd, UI_SET_RELBIT, REL_HWHEEL);
 
     struct uinput_abs_setup abs;
     memset(&abs, 0, sizeof(abs));
@@ -112,13 +142,31 @@ void rfb_key_hook(rfbBool down, rfbKeySym keysym, rfbClientPtr cl)
         fprintf(stderr, "Keycode %d >= %d\n", search.keycode, UINPUT_MAX_KEY);
         return;
     }
-    if (down != kmsvnc->input->keystate[search.keycode])
+    struct input_client_state *state = cl->clientData;
+    if (!state) return;
+    pthread_mutex_lock(&input_lock);
+    state->keys[search.keycode] = !!down;
+    if (!down && client_key_held(cl->screen, search.keycode)) {
+        pthread_mutex_unlock(&input_lock);
+        return;
+    }
+    /* Повторы клавиш приходят от клиента, включая удержание стрелок. */
+    if (down || kmsvnc->input->keystate[search.keycode])
     {
+        /* Сенсорная клавиатура может прислать символ без отдельного Shift. */
+        int shift = search.level == 1 &&
+            !kmsvnc->input->keystate[KEY_LEFTSHIFT + 8] &&
+            !kmsvnc->input->keystate[KEY_RIGHTSHIFT + 8];
+        struct input_event modifier[] = {
+            { .type = EV_KEY, .code = KEY_LEFTSHIFT, .value = 1 },
+            { .type = EV_SYN, .code = SYN_REPORT },
+        };
+        if (shift) KMSVNC_WRITE_MAY(kmsvnc->input->uinput_fd, modifier, sizeof(modifier));
         struct input_event ies[] = {
             {
                 .type = EV_KEY,
                 .code = search.keycode - 8, // magic
-                .value = down,
+                .value = down ? (kmsvnc->input->keystate[search.keycode] ? 2 : 1) : 0,
                 .time.tv_sec = 0,
                 .time.tv_usec = 0,
             },
@@ -133,12 +181,22 @@ void rfb_key_hook(rfbBool down, rfbKeySym keysym, rfbClientPtr cl)
             KMSVNC_WRITE_MAY(kmsvnc->input->uinput_fd, &ies[i], sizeof(ies[0]));
         }
 
-        kmsvnc->input->keystate[search.keycode] = down;
+        if (shift) {
+            modifier[0].value = 0;
+            KMSVNC_WRITE_MAY(kmsvnc->input->uinput_fd, modifier, sizeof(modifier));
+        }
+        kmsvnc->input->keystate[search.keycode] = !!down;
     }
+    pthread_mutex_unlock(&input_lock);
 }
 
 void rfb_ptr_hook(int mask, int screen_x, int screen_y, rfbClientPtr cl)
 {
+    struct input_client_state *state = cl->clientData;
+    if (!state) return;
+    pthread_mutex_lock(&input_lock);
+    state->buttons = mask & 7;
+    int buttons = client_buttons(cl->screen);
     // printf("pointer to %d, %d\n", screen_x, screen_y);
     float global_x = (float)(screen_x + kmsvnc->input_offx);
     float global_y = (float)(screen_y + kmsvnc->input_offy);
@@ -158,15 +216,15 @@ void rfb_ptr_hook(int mask, int screen_x, int screen_y, rfbClientPtr cl)
         {
             .type = EV_KEY,
             .code = BTN_LEFT,
-            .value = !!(mask & 0b1)},
+            .value = !!(buttons & 0b1)},
         {
             .type = EV_KEY,
             .code = BTN_MIDDLE,
-            .value = !!(mask & 0b10)},
+            .value = !!(buttons & 0b10)},
         {
             .type = EV_KEY,
             .code = BTN_RIGHT,
-            .value = !!(mask & 0b100)},
+            .value = !!(buttons & 0b100)},
         {
             .type = EV_SYN,
             .code = SYN_REPORT,
@@ -196,14 +254,24 @@ void rfb_ptr_hook(int mask, int screen_x, int screen_y, rfbClientPtr cl)
             KMSVNC_WRITE_MAY(kmsvnc->input->uinput_fd, &ies2[i], sizeof(ies2[0]));
         }
     }
+    if (mask & 0b1100000) {
+        struct input_event horizontal[] = {
+            { .type = EV_REL, .code = REL_HWHEEL,
+              .value = mask & 0b100000 ? -1 : 1 },
+            { .type = EV_SYN, .code = SYN_REPORT },
+        };
+        KMSVNC_WRITE_MAY(kmsvnc->input->uinput_fd, horizontal, sizeof(horizontal));
+    }
+
+    pthread_mutex_unlock(&input_lock);
 }
 
 static void wake_system_up()
 {
     struct input_event ies1[] = {
         {
-            .type = EV_REL,
-            .code = REL_X,
+            .type = EV_ABS,
+            .code = ABS_X,
             .value = 1,
         },
         {
@@ -212,9 +280,9 @@ static void wake_system_up()
             .value = 0,
         },
         {
-            .type = EV_REL,
-            .code = REL_X,
-            .value = -1,
+            .type = EV_ABS,
+            .code = ABS_X,
+            .value = 0,
         },
         {
             .type = EV_SYN,
@@ -226,4 +294,37 @@ static void wake_system_up()
     {
         KMSVNC_WRITE_MAY(kmsvnc->input->uinput_fd, &ies1[i], sizeof(ies1[0]));
     }
+}
+
+static void input_client_gone(rfbClientPtr cl)
+{
+    pthread_mutex_lock(&input_lock);
+    struct input_client_state *state = cl->clientData;
+    cl->clientData = NULL;
+    if (!state) { pthread_mutex_unlock(&input_lock); return; }
+    if (!kmsvnc->input) { free(state); pthread_mutex_unlock(&input_lock); return; }
+    for (int key = 8; key < UINPUT_MAX_KEY; key++) {
+        if (!state->keys[key] || client_key_held(cl->screen, key)) continue;
+        struct input_event release = { .type = EV_KEY, .code = key - 8, .value = 0 };
+        KMSVNC_WRITE_MAY(kmsvnc->input->uinput_fd, &release, sizeof(release));
+        kmsvnc->input->keystate[key] = 0;
+    }
+    int buttons = client_buttons(cl->screen);
+    struct input_event release[] = {
+        { .type = EV_KEY, .code = BTN_LEFT, .value = !!(buttons & 1) },
+        { .type = EV_KEY, .code = BTN_MIDDLE, .value = !!(buttons & 2) },
+        { .type = EV_KEY, .code = BTN_RIGHT, .value = !!(buttons & 4) },
+        { .type = EV_SYN, .code = SYN_REPORT },
+    };
+    KMSVNC_WRITE_MAY(kmsvnc->input->uinput_fd, release, sizeof(release));
+    free(state);
+    pthread_mutex_unlock(&input_lock);
+}
+
+enum rfbNewClientAction input_new_client(rfbClientPtr cl)
+{
+    cl->clientData = calloc(1, sizeof(struct input_client_state));
+    if (!cl->clientData) return RFB_CLIENT_REFUSE;
+    cl->clientGoneHook = input_client_gone;
+    return RFB_CLIENT_ACCEPT;
 }

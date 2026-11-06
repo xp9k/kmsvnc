@@ -15,6 +15,7 @@
 #include "input.h"
 #include "drm.h"
 #include "va.h"
+#include "egl_capture.h"
 
 struct kmsvnc_data *kmsvnc = NULL;
 
@@ -463,6 +464,7 @@ int main(int argc, char **argv)
         }
         printf("attempt to write %d bytes\n", max_size);
         if (wfd > 0) {
+            char *captured = NULL;
             if (kmsvnc->va) {
                 if (!kmsvnc->drm->mapped) kmsvnc->drm->mapped = malloc(max_size);
                 if (!kmsvnc->drm->mapped) {
@@ -471,8 +473,16 @@ int main(int argc, char **argv)
                 }
                 va_hwframe_to_vaapi(kmsvnc->drm->mapped);
             }
-            KMSVNC_WRITE_MAY(wfd, kmsvnc->drm->mapped, (ssize_t)max_size);
+            if (!kmsvnc->drm->mapped && kmsvnc->drm->skip_map) {
+                max_size = kmsvnc->drm->mfb->width * kmsvnc->drm->mfb->height * BYTES_PER_PIXEL;
+                captured = calloc(1, max_size);
+                if (!captured) { close(wfd); cleanup(); return 1; }
+                kmsvnc->drm->funcs->convert(NULL, kmsvnc->drm->mfb->width, kmsvnc->drm->mfb->height, captured);
+            }
+            KMSVNC_WRITE_MAY(wfd, captured ? captured : kmsvnc->drm->mapped, (ssize_t)max_size);
+            free(captured);
             fsync(wfd);
+            close(wfd);
             printf("wrote raw frame buffer to %s\n", kmsvnc->debug_capture_fb);
         }
         else {
@@ -520,6 +530,7 @@ int main(int argc, char **argv)
         return 1;
     }
     kmsvnc->server->desktopName = kmsvnc->vnc_opt->desktop_name;
+    egl_capture_configure_vnc(kmsvnc->server);
     kmsvnc->server->frameBuffer = kmsvnc->buf;
     kmsvnc->server->port = kmsvnc->vnc_opt->port;
     kmsvnc->server->listenInterface = kmsvnc->vnc_opt->bind->s_addr;
@@ -527,6 +538,7 @@ int main(int argc, char **argv)
     kmsvnc->server->listen6Interface = kmsvnc->vnc_opt->bind6;
     kmsvnc->server->alwaysShared = kmsvnc->vnc_opt->always_shared;
     if (!kmsvnc->disable_input) {
+        kmsvnc->server->newClientHook = input_new_client;
         kmsvnc->server->kbdAddEvent = rfb_key_hook;
         kmsvnc->server->ptrAddEvent = rfb_ptr_hook;
     }

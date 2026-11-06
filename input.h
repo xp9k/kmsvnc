@@ -14,3 +14,5 @@ void uinput_cleanup();
 int uinput_init();
 void rfb_key_hook(rfbBool down, rfbKeySym keysym, rfbClientPtr cl);
 void rfb_ptr_hook(int mask, int screen_x, int screen_y, rfbClientPtr cl);
+
+enum rfbNewClientAction input_new_client(rfbClientPtr cl);

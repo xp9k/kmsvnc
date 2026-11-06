@@ -10,6 +10,7 @@
 
 #include "drm.h"
 #include "va.h"
+#include "egl_capture.h"
 
 #ifndef DISABLE_KMSVNC_SCREEN_BLANK
     #include "drm_master.h"
@@ -183,6 +184,7 @@ void drm_sync_noop(int drmfd)
 
 void drm_cleanup() {
     if (kmsvnc->drm) {
+        egl_capture_cleanup();
 #ifndef DISABLE_KMSVNC_SCREEN_BLANK
         if (kmsvnc->drm->gamma && kmsvnc->drm->gamma->size && kmsvnc->drm->gamma->red && kmsvnc->drm->gamma->green && kmsvnc->drm->gamma->blue) {
             if (drmModeCrtcSetGamma(kmsvnc->drm->drm_master_fd ?: kmsvnc->drm->drm_fd, kmsvnc->drm->plane->crtc_id, kmsvnc->drm->gamma->size, kmsvnc->drm->gamma->red, kmsvnc->drm->gamma->green, kmsvnc->drm->gamma->blue)) perror("Failed to restore gamma");
@@ -697,12 +699,9 @@ int drm_vendors() {
     }
     else if (strcmp(driver_name, "nvidia-drm") == 0)
     {
-        if (check_pixfmt_non_vaapi()) return 1;
-        printf("warn: nvidia card detected. Currently only x-tiled framebuffer is supported. Performance may suffer.\n");
-        if (drm->mfb->modifier != DRM_FORMAT_MOD_NONE && drm->mfb->modifier != DRM_FORMAT_MOD_LINEAR) {
-            drm->funcs->convert = &convert_nvidia_x_tiled_kmsbuf;
-        }
-        if (drm_kmsbuf_dumb()) return 1;
+        if (egl_capture_init()) return 1;
+        drm->skip_map = 1;
+        drm->funcs->convert = egl_capture_frame;
     }
     else if (strcmp(driver_name, "vmwgfx") == 0 ||
              strcmp(driver_name, "vboxvideo") == 0 ||

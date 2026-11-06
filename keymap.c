@@ -58,20 +58,25 @@ void key_iter(struct xkb_keymap *xkb, xkb_keycode_t key, void *data)
     {
         return; // We are done
     }
-    xkb_level_index_t num_levels = xkb_keymap_num_levels_for_key(xkb, key, 0);
+    /* Символы ищутся во всех настроенных раскладках, в том числе русской. */
+    for (xkb_layout_index_t layout = 0; layout < xkb_keymap_num_layouts_for_key(xkb, key); layout++) {
+    xkb_level_index_t num_levels = xkb_keymap_num_levels_for_key(xkb, key, layout);
     for (xkb_level_index_t i = 0; i < num_levels; i++)
     {
         const xkb_keysym_t *syms;
-        int num_syms = xkb_keymap_key_get_syms_by_level(xkb, key, 0, i, &syms);
+        int num_syms = xkb_keymap_key_get_syms_by_level(xkb, key, layout, i, &syms);
         for (int k = 0; k < num_syms; k++)
         {
-            if (syms[k] == search->keysym)
+            if (syms[k] == search->keysym ||
+                (xkb_keysym_to_utf32(search->keysym) &&
+                 xkb_keysym_to_utf32(syms[k]) == xkb_keysym_to_utf32(search->keysym)))
             {
                 search->keycode = key;
                 search->level = i;
                 goto end;
             }
         }
+    }
     }
 end:
     return;

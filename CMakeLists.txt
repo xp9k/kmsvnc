@@ -7,14 +7,19 @@ endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(PkgConfig REQUIRED)
+find_package(Threads REQUIRED)
 pkg_search_module(LIBDRM REQUIRED libdrm)
 pkg_search_module(LIBVNCSERVER REQUIRED libvncserver)
 pkg_search_module(XKBCOMMON REQUIRED xkbcommon)
 pkg_search_module(LIBVA REQUIRED libva)
 pkg_search_module(LIBVA_DRM REQUIRED libva-drm)
+pkg_search_module(EGL REQUIRED egl)
+pkg_search_module(GLES REQUIRED glesv2)
+pkg_search_module(GBM REQUIRED gbm)
+pkg_search_module(JSONC REQUIRED json-c)
 
 add_executable(kmsvnc)
-set(kmsvnc_SOURCES kmsvnc.c drm.c input.c keymap.c va.c drm_master.c)
+set(kmsvnc_SOURCES kmsvnc.c drm.c input.c keymap.c va.c drm_master.c egl_capture.c screen_layout.c)
 
 include(CheckIncludeFiles)
 CHECK_INCLUDE_FILES("linux/uinput.h;linux/dma-buf.h" HAVE_LINUX_API_HEADERS)
@@ -50,13 +55,22 @@ target_include_directories(kmsvnc PUBLIC
   ${XKBCOMMON_INCLUDE_DIRS}
   ${LIBVA_INCLUDE_DIRS}
   ${LIBVA_DRM_INCLUDE_DIRS}
+  ${EGL_INCLUDE_DIRS}
+  ${GLES_INCLUDE_DIRS}
+  ${GBM_INCLUDE_DIRS}
+  ${JSONC_INCLUDE_DIRS}
 )
 target_link_libraries(kmsvnc PUBLIC
+  Threads::Threads
   m
   ${LIBDRM_LIBRARIES}
   ${LIBVNCSERVER_LIBRARIES}
   ${XKBCOMMON_LIBRARIES}
   ${LIBVA_LIBRARIES}
   ${LIBVA_DRM_LIBRARIES}
+  ${EGL_LIBRARIES}
+  ${GLES_LIBRARIES}
+  ${GBM_LIBRARIES}
+  ${JSONC_LIBRARIES}
 )
 install(TARGETS kmsvnc RUNTIME DESTINATION bin)
