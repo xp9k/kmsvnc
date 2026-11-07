@@ -16,6 +16,7 @@
 #include "drm.h"
 #include "va.h"
 #include "egl_capture.h"
+#include "thumbnail.h"
 
 struct kmsvnc_data *kmsvnc = NULL;
 
@@ -559,13 +560,14 @@ int main(int argc, char **argv)
                 kmsvnc->server->passwordCheck = rfbCheckPasswordByList;
             }
     }
+    thumbnail_register();
     rfbInitServer(kmsvnc->server);
     rfbRunEventLoop(kmsvnc->server, -1, TRUE);
     int cursor_frame = 0;
     while (rfbIsActive(kmsvnc->server))
     {
         between_frames();
-        if (kmsvnc->server->clientHead)
+        if (kmsvnc->server->clientHead && thumbnail_capture_due(kmsvnc->server))
         {
             kmsvnc->drm->funcs->sync_start(kmsvnc->drm->prime_fd);
             kmsvnc->drm->funcs->convert(kmsvnc->drm->mapped, kmsvnc->drm->mfb->width, kmsvnc->drm->mfb->height, kmsvnc->buf1);

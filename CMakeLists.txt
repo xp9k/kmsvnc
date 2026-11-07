@@ -9,7 +9,28 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)
 pkg_search_module(LIBDRM REQUIRED libdrm)
-pkg_search_module(LIBVNCSERVER REQUIRED libvncserver)
+# libvncserver: пакет dno-tool встраивает закреплённую версию статически
+# (KMSVNC_LIBVNCSERVER_PREFIX — каталог её установки). Системная библиотека МОС 12
+# и МОС 13 различается раскладкой структур под одним soname, а 0.9.13 теряет
+# буферы Zlib при каждом отключении клиента. Без префикса берётся системная
+# (только для локальной сборки).
+set(KMSVNC_LIBVNCSERVER_PREFIX "" CACHE PATH "Каталог установки статической libvncserver")
+if(KMSVNC_LIBVNCSERVER_PREFIX)
+  find_library(LIBVNCSERVER_STATIC NAMES libvncserver.a
+    PATHS "${KMSVNC_LIBVNCSERVER_PREFIX}/lib" "${KMSVNC_LIBVNCSERVER_PREFIX}/lib64" NO_DEFAULT_PATH)
+  if(NOT LIBVNCSERVER_STATIC)
+    message(FATAL_ERROR "libvncserver.a не найдена в ${KMSVNC_LIBVNCSERVER_PREFIX}")
+  endif()
+  pkg_search_module(ZLIB REQUIRED zlib)
+  pkg_search_module(JPEG REQUIRED libjpeg)
+  pkg_search_module(PNG REQUIRED libpng)
+  set(LIBVNCSERVER_INCLUDE_DIRS "${KMSVNC_LIBVNCSERVER_PREFIX}/include")
+  set(LIBVNCSERVER_LIBRARIES "${LIBVNCSERVER_STATIC}" ${JPEG_LIBRARIES} ${PNG_LIBRARIES} ${ZLIB_LIBRARIES} Threads::Threads)
+  message(STATUS "libvncserver: встроенная ${LIBVNCSERVER_STATIC}")
+else()
+  pkg_search_module(LIBVNCSERVER REQUIRED libvncserver)
+  message(WARNING "libvncserver: системная (для пакета задайте KMSVNC_LIBVNCSERVER_PREFIX)")
+endif()
 pkg_search_module(XKBCOMMON REQUIRED xkbcommon)
 pkg_search_module(LIBVA REQUIRED libva)
 pkg_search_module(LIBVA_DRM REQUIRED libva-drm)
@@ -19,7 +40,7 @@ pkg_search_module(GBM REQUIRED gbm)
 pkg_search_module(JSONC REQUIRED json-c)
 
 add_executable(kmsvnc)
-set(kmsvnc_SOURCES kmsvnc.c drm.c input.c keymap.c va.c drm_master.c egl_capture.c screen_layout.c)
+set(kmsvnc_SOURCES kmsvnc.c drm.c input.c keymap.c va.c drm_master.c egl_capture.c screen_layout.c thumbnail.c)
 
 include(CheckIncludeFiles)
 CHECK_INCLUDE_FILES("linux/uinput.h;linux/dma-buf.h" HAVE_LINUX_API_HEADERS)
