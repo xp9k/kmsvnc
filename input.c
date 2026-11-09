@@ -144,6 +144,8 @@ void rfb_key_hook(rfbBool down, rfbKeySym keysym, rfbClientPtr cl)
     }
     struct input_client_state *state = cl->clientData;
     if (!state) return;
+    /* Ввод выводит захват из простоя: изменение снимется без задержки. */
+    capture_wakeup(CAPTURE_WAKE_ACTIVITY);
     pthread_mutex_lock(&input_lock);
     state->keys[search.keycode] = !!down;
     if (!down && client_key_held(cl->screen, search.keycode)) {
@@ -194,6 +196,7 @@ void rfb_ptr_hook(int mask, int screen_x, int screen_y, rfbClientPtr cl)
 {
     struct input_client_state *state = cl->clientData;
     if (!state) return;
+    capture_wakeup(CAPTURE_WAKE_ACTIVITY);
     pthread_mutex_lock(&input_lock);
     state->buttons = mask & 7;
     int buttons = client_buttons(cl->screen);

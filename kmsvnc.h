@@ -1,6 +1,8 @@
 #pragma once
 
 #include <rfb/rfb.h>
+/* sraRgn*: rfb.h объявляет только тип региона (нужен rfbBool из rfb.h). */
+#include <rfb/rfbregion.h>
 #include <stdint.h>
 #include <xkbcommon/xkbcommon.h>
 
@@ -143,6 +145,11 @@ struct kmsvnc_va_data
     VAImageFormat* selected_fmt;
     const char *vendor_string;
 };
+
+/* Разбудить цикл захвата: запрос кадра или ввод/новый клиент (выход из простоя). */
+#define CAPTURE_WAKE_REQUEST 1
+#define CAPTURE_WAKE_ACTIVITY 2
+void capture_wakeup(int reason);
 
 #define KMSVNC_FATAL(...) do{ fprintf(stderr, __VA_ARGS__); return 1; } while(0)
 #define KMSVNC_ARRAY_ELEMENTS(x) (sizeof(x) / sizeof(x[0]))

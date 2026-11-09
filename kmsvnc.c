@@ -9,6 +9,8 @@
 #include <unistd.h>
 #include <argp.h>
 #include <arpa/inet.h>
+#include <errno.h>
+#include <pthread.h>
 
 #include "kmsvnc.h"
 #include "keymap.h"
@@ -21,77 +23,180 @@
 struct kmsvnc_data *kmsvnc = NULL;
 
 #define NS_IN_S 1000000000
+#define NS_IN_MS 1000000LL
 
-static void between_frames()
+/* Сторона плитки при сравнении кадров. */
+#define TILE_SIDE 64
+/* Без изменений и ввода дольше этого — редкая съёмка. */
+#define IDLE_AFTER_MS 1000
+#define IDLE_INTERVAL_MS 100
+/* Ожидание, когда снимать нечего (нет запросов, нет клиентов). */
+#define WAIT_NO_DEMAND_MS 50
+#define WAIT_NO_CLIENTS_MS 1000
+#define STATS_INTERVAL_MS 10000
+
+/*
+ * Пробуждение главного цикла: запрос кадра, ввод или новый клиент. Флаг
+ * взводится до того, как libvncserver добавит запрос в requestedRegion,
+ * поэтому сам флаг тоже считается открытым запросом.
+ */
+static pthread_mutex_t capture_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t capture_cond;
+static int capture_kick = 0; /* маска CAPTURE_WAKE_* */
+
+static long long monotonic_ns(void)
 {
-    static struct timespec now = {0, 0}, then = {0, 0}, tmp = {0, 0};
-
+    struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
-    memcpy((char *)&then, (char *)&tmp, sizeof(struct timespec));
-    tmp.tv_nsec += kmsvnc->vnc_opt->sleep_ns;
-    if (tmp.tv_nsec >= NS_IN_S)
-    {
-        tmp.tv_sec++;
-        tmp.tv_nsec %= NS_IN_S;
-    }
-    if (now.tv_sec < tmp.tv_sec || (now.tv_sec == tmp.tv_sec && now.tv_nsec < tmp.tv_nsec))
-    {
-        then.tv_sec = tmp.tv_sec - now.tv_sec;
-        then.tv_nsec = tmp.tv_nsec - now.tv_nsec;
-        if (then.tv_nsec < 0)
-        {
-            then.tv_sec--;
-            then.tv_nsec += NS_IN_S;
-        }
-        nanosleep(&then, &then);
-    }
-    memcpy((char *)&now, (char *)&then, sizeof(struct timespec));
+    return (long long)now.tv_sec * NS_IN_S + now.tv_nsec;
 }
 
-static void update_screen_buf(char* to, char *from, int width, int height) {
-    uint64_t *double_pix_from = (uint64_t *)from;
-    uint64_t *double_pix_to = (uint64_t *)to;
-    int min_x = INT32_MAX;
-    int min_y = INT32_MAX;
-    int max_x = -1;
-    int max_y = -1;
-    if (!kmsvnc->vnc_opt->disable_cmpfb && width % 2 == 0) {
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x+=2) {
-                if (*double_pix_from != *double_pix_to) {
-                    if (x < min_x) {
-                        min_x = x;
-                    }
-                    if (x > max_x) {
-                        max_x = x;
-                    }
-                    if (y < min_y) {
-                        min_y = y;
-                    }
-                    if (y > max_y) {
-                        max_y = y;
-                    }
-                }
-                double_pix_from ++;
-                double_pix_to ++;
-            }
-        }
+void capture_wakeup(int reason)
+{
+    pthread_mutex_lock(&capture_lock);
+    capture_kick |= reason;
+    pthread_cond_signal(&capture_cond);
+    pthread_mutex_unlock(&capture_lock);
+}
+
+static void capture_init_wait(void)
+{
+    pthread_condattr_t attributes;
+    pthread_condattr_init(&attributes);
+    pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC);
+    pthread_cond_init(&capture_cond, &attributes);
+    pthread_condattr_destroy(&attributes);
+}
+
+/* Ждать пробуждения не дольше чем до deadline; возвращает и сбрасывает маску. */
+static int capture_wait(long long deadline)
+{
+    struct timespec until = { deadline / NS_IN_S, deadline % NS_IN_S };
+    pthread_mutex_lock(&capture_lock);
+    while (!capture_kick && !kmsvnc->shutdown) {
+        if (pthread_cond_timedwait(&capture_cond, &capture_lock, &until)) break;
     }
-    else {
-        memcpy(to, from, width * height * BYTES_PER_PIXEL);
-        rfbMarkRectAsModified(kmsvnc->server, 0, 0, width, height);
+    int kicked = capture_kick;
+    capture_kick = 0;
+    pthread_mutex_unlock(&capture_lock);
+    return kicked;
+}
+
+static void sleep_until(long long deadline)
+{
+    struct timespec until = { deadline / NS_IN_S, deadline % NS_IN_S };
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &until, NULL) == EINTR && !kmsvnc->shutdown) {}
+}
+
+static void capture_request_hook(rfbClientPtr cl, rfbFramebufferUpdateRequestMsg *request)
+{
+    (void)cl;
+    (void)request;
+    capture_wakeup(CAPTURE_WAKE_REQUEST);
+}
+
+/* Новый клиент: пробуждение по его запросам кадра, затем ввод (если включён). */
+static enum rfbNewClientAction capture_new_client(rfbClientPtr cl)
+{
+    cl->clientFramebufferUpdateRequestHook = capture_request_hook;
+    capture_wakeup(CAPTURE_WAKE_ACTIVITY);
+    if (!kmsvnc->disable_input) {
+        return input_new_client(cl);
+    }
+    return RFB_CLIENT_ACCEPT;
+}
+
+/*
+ * Есть ли клиент полного кадра (просмотр, управление, «живой» клиент с
+ * масштабом), который ждёт обновления. Пассивные клиенты миниатюр снимаются
+ * по своим правилам (thumbnail_capture_due). Пока клиент принимает прошлый
+ * кадр, его requestedRegion пуст: снимать для него незачем.
+ */
+static int live_client_waiting(rfbScreenInfoPtr server)
+{
+    int waiting = 0;
+    rfbClientIteratorPtr iterator = rfbGetClientIterator(server);
+    rfbClientPtr cl;
+    while (!waiting && (cl = rfbClientIteratorNext(iterator))) {
+        if (cl->state != RFB_NORMAL || thumbnail_client_passive(cl)) continue;
+        LOCK(cl->updateMutex);
+        waiting = !sraRgnEmpty(cl->requestedRegion);
+        UNLOCK(cl->updateMutex);
+    }
+    rfbReleaseClientIterator(iterator);
+    return waiting;
+}
+
+/* Экспортируется libvncserver (scale.c), в rfb.h не объявлена. */
+extern void rfbScaledScreenUpdate(rfbScreenInfoPtr screen, int x1, int y1, int x2, int y2);
+
+/*
+ * Добавить изменённый отрезок в регион и пересчитать его в уменьшенных
+ * копиях кадра (миниатюры, «живые» клиенты). rfbMarkRegionAsModified, в
+ * отличие от rfbMarkRectAsModified, копии не обновляет: без этого вызова
+ * уменьшенный кадр оставался таким, каким был при создании копии.
+ */
+static void mark_region(sraRegionPtr *region, int x1, int y1, int x2, int y2)
+{
+    rfbScaledScreenUpdate(kmsvnc->server, x1, y1, x2, y2);
+    sraRegionPtr rect = sraRgnCreateRect(x1, y1, x2, y2);
+    if (!*region) {
+        *region = rect;
         return;
     }
-    max_x = max_x < 0 ? 0 : max_x;
-    max_y = max_y < 0 ? 0 : max_y;
-    min_x = min_x > width ? 0 : min_x;
-    min_y = min_y > height ? 0 : min_y;
+    sraRgnOr(*region, rect);
+    sraRgnDestroy(rect);
+}
 
-    //printf("dirty: %d, %d, %d, %d\n", min_x, min_y, max_x, max_y);
-    if (max_x || max_y || min_x || min_y) {
-        memcpy(to, from, width * height * BYTES_PER_PIXEL);
-        rfbMarkRectAsModified(kmsvnc->server, min_x, min_y, max_x + 2, max_y + 1);
+/*
+ * Перенести снимок в кадр сервера; 1 — что-то изменилось и отмечено.
+ *
+ * Сравнение плитками TILE_SIDE×TILE_SIDE: копируются и отмечаются только
+ * изменённые плитки. Прежний общий прямоугольник от первого до последнего
+ * изменения на 4K при часах в одном углу и курсоре в другом отправлял весь
+ * экран. Изменённые плитки одной полосы склеиваются в отрезки, вертикальные
+ * соседи объединяет регион libvncserver.
+ */
+static int update_screen_buf(char *to, const char *from, int width, int height, int *tiles_out)
+{
+    *tiles_out = 0;
+    if (kmsvnc->vnc_opt->disable_cmpfb) {
+        memcpy(to, from, (size_t)width * height * BYTES_PER_PIXEL);
+        rfbMarkRectAsModified(kmsvnc->server, 0, 0, width, height);
+        return 1;
     }
+    size_t stride = (size_t)width * BYTES_PER_PIXEL;
+    sraRegionPtr region = NULL;
+    int tiles = 0;
+    for (int ty = 0; ty < height; ty += TILE_SIDE) {
+        int th = height - ty < TILE_SIDE ? height - ty : TILE_SIDE;
+        int run = -1;
+        for (int tx = 0; tx < width; tx += TILE_SIDE) {
+            int tw = width - tx < TILE_SIDE ? width - tx : TILE_SIDE;
+            size_t offset = ty * stride + (size_t)tx * BYTES_PER_PIXEL;
+            size_t length = (size_t)tw * BYTES_PER_PIXEL;
+            int y = 0;
+            while (y < th && !memcmp(from + offset + y * stride, to + offset + y * stride, length)) y++;
+            if (y < th) {
+                /* Строки до первой отличающейся совпадают: копировать с неё. */
+                for (; y < th; y++) memcpy(to + offset + y * stride, from + offset + y * stride, length);
+                tiles++;
+                if (run < 0) run = tx;
+            }
+            else if (run >= 0) {
+                mark_region(&region, run, ty, tx, ty + th);
+                run = -1;
+            }
+        }
+        if (run >= 0) mark_region(&region, run, ty, width, ty + th);
+    }
+    *tiles_out = tiles;
+    if (!region) {
+        return 0;
+    }
+    rfbMarkRegionAsModified(kmsvnc->server, region);
+    sraRgnDestroy(region);
+    return 1;
 }
 
 static inline void update_vnc_cursor(char *data, int width, int height) {
@@ -541,8 +646,8 @@ int main(int argc, char **argv)
     kmsvnc->server->ipv6port = kmsvnc->vnc_opt->disable_ipv6 ? 0 : kmsvnc->vnc_opt->port;
     kmsvnc->server->listen6Interface = kmsvnc->vnc_opt->bind6;
     kmsvnc->server->alwaysShared = kmsvnc->vnc_opt->always_shared;
+    kmsvnc->server->newClientHook = capture_new_client;
     if (!kmsvnc->disable_input) {
-        kmsvnc->server->newClientHook = input_new_client;
         kmsvnc->server->kbdAddEvent = rfb_key_hook;
         kmsvnc->server->ptrAddEvent = rfb_ptr_hook;
     }
@@ -565,27 +670,81 @@ int main(int argc, char **argv)
     }
     thumbnail_register();
     rfbInitServer(kmsvnc->server);
+    capture_init_wait();
     rfbRunEventLoop(kmsvnc->server, -1, TRUE);
     int cursor_frame = 0;
+    long long frame_ns = kmsvnc->vnc_opt->sleep_ns;
+    long long last_capture = 0;
+    long long last_activity = monotonic_ns();
+    /* Замеры для --debug. */
+    long long stats_since = last_activity, stats_capture = 0, stats_compare = 0;
+    long long stats_frames = 0, stats_changed = 0, stats_tiles = 0;
+    /* Пробуждение, пойманное во время ожидания, действует на следующем такте. */
+    int carried = 0;
     while (rfbIsActive(kmsvnc->server))
     {
-        between_frames();
-        if (kmsvnc->server->clientHead && thumbnail_capture_due(kmsvnc->server))
-        {
-            kmsvnc->drm->funcs->sync_start(kmsvnc->drm->prime_fd);
-            kmsvnc->drm->funcs->convert(kmsvnc->drm->mapped, kmsvnc->drm->mfb->width, kmsvnc->drm->mfb->height, kmsvnc->buf1);
-            kmsvnc->drm->funcs->sync_end(kmsvnc->drm->prime_fd);
-            update_screen_buf(kmsvnc->buf, kmsvnc->buf1, kmsvnc->drm->mfb->width, kmsvnc->drm->mfb->height);
-            if (kmsvnc->capture_cursor) {
-                cursor_frame++;
-                cursor_frame %= CURSOR_FRAMESKIP;
-                if (!cursor_frame) {
-                    char *data = NULL;
-                    int width, height;
-                    int err = drm_dump_cursor_plane(&data, &width, &height);
-                    if (!err && data) {
-                        update_vnc_cursor(data, width, height);
-                    }
+        /* Не чаще --fps. */
+        sleep_until(last_capture + frame_ns);
+        int kicked = capture_wait(0) | carried;
+        carried = 0;
+        long long now = monotonic_ns();
+        if (!kmsvnc->server->clientHead) {
+            carried = capture_wait(now + WAIT_NO_CLIENTS_MS * NS_IN_MS);
+            continue;
+        }
+        /* Из простоя выводят ввод и новый клиент; запрос кадра только будит. */
+        if (kicked & CAPTURE_WAKE_ACTIVITY) last_activity = now;
+        /*
+         * Простой: экран не менялся и ввода не было дольше IDLE_AFTER_MS —
+         * живые клиенты снимаются раз в IDLE_INTERVAL_MS, пока не придёт
+         * ввод или не изменится экран. Запросы кадра простой не прерывают:
+         * клиент миниатюр присылает их и без изменений экрана.
+         */
+        int idle = now - last_activity >= IDLE_AFTER_MS * NS_IN_MS;
+        int live = kicked || live_client_waiting(kmsvnc->server);
+        if (live && idle && now - last_capture < IDLE_INTERVAL_MS * NS_IN_MS) {
+            carried = capture_wait(last_capture + IDLE_INTERVAL_MS * NS_IN_MS);
+            continue;
+        }
+        if (!thumbnail_capture_due(kmsvnc->server, live)) {
+            carried = capture_wait(now + WAIT_NO_DEMAND_MS * NS_IN_MS);
+            continue;
+        }
+        last_capture = now;
+        kmsvnc->drm->funcs->sync_start(kmsvnc->drm->prime_fd);
+        kmsvnc->drm->funcs->convert(kmsvnc->drm->mapped, kmsvnc->drm->mfb->width, kmsvnc->drm->mfb->height, kmsvnc->buf1);
+        kmsvnc->drm->funcs->sync_end(kmsvnc->drm->prime_fd);
+        long long captured = monotonic_ns();
+        int tiles = 0;
+        int changed = update_screen_buf(kmsvnc->buf, kmsvnc->buf1, kmsvnc->drm->mfb->width, kmsvnc->drm->mfb->height, &tiles);
+        long long compared = monotonic_ns();
+        if (changed) last_activity = compared;
+        /* Клиенты миниатюр, ждавшие этого снимка, получают ответ. */
+        thumbnail_capture_finished(kmsvnc->server, changed);
+        if (kmsvnc->debug_enabled) {
+            stats_capture += captured - now;
+            stats_compare += compared - captured;
+            stats_frames++;
+            stats_changed += changed;
+            stats_tiles += tiles;
+            if (compared - stats_since >= STATS_INTERVAL_MS * NS_IN_MS) {
+                double seconds = (double)(compared - stats_since) / NS_IN_S;
+                KMSVNC_DEBUG("capture: %.1f frames/s, %.1f ms capture, %.1f ms compare, %lld changed, %.0f tiles/changed frame\n",
+                    stats_frames / seconds, stats_capture / 1e6 / stats_frames, stats_compare / 1e6 / stats_frames,
+                    stats_changed, stats_changed ? (double)stats_tiles / stats_changed : 0.0);
+                stats_since = compared;
+                stats_capture = stats_compare = stats_frames = stats_changed = stats_tiles = 0;
+            }
+        }
+        if (kmsvnc->capture_cursor) {
+            cursor_frame++;
+            cursor_frame %= CURSOR_FRAMESKIP;
+            if (!cursor_frame) {
+                char *data = NULL;
+                int width, height;
+                int err = drm_dump_cursor_plane(&data, &width, &height);
+                if (!err && data) {
+                    update_vnc_cursor(data, width, height);
                 }
             }
         }

@@ -38,6 +38,8 @@ static struct {
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC bind_image;
     int failed;
     int count;
+    /* Выходы покрывают холст целиком: очищать его перед кадром не нужно. */
+    int covered;
     int width, height;
     struct captured_output outputs[MAX_OUTPUTS];
     char desktop_name[640];
@@ -288,7 +290,8 @@ static int prepare_outputs(void)
     return 0;
 }
 
-static int read_output(struct captured_output *out)
+/* Читает текущий буфер выхода в dest (out->pixels или сразу кадр сервера). */
+static int read_output(struct captured_output *out, char *dest)
 {
     int fd = kmsvnc->drm->drm_fd;
     drmModePlane *plane = drmModeGetPlane(fd, out->plane_id);
@@ -300,7 +303,7 @@ static int read_output(struct captured_output *out)
     drmModeFB2 *fb = drmModeGetFB2(fd, fb_id);
     if (!fb) return 1;
     int failed = fb->width != out->native_width || fb->height != out->native_height ||
-        read_frame(fb, out->pixels);
+        read_frame(fb, dest);
     close_handles(fb);
     drmModeFreeFB2(fb);
     return failed;
@@ -364,7 +367,20 @@ int egl_capture_init(int own_device)
     if (glGetError() != GL_NO_ERROR) EGL_FAIL("GL texture/framebuffer setup failed");
     /* Проверяем импорт каждого выхода до открытия VNC-порта. */
     if (prepare_outputs()) EGL_FAIL("no capturable outputs or unknown monitor layout");
-    for (int n = 0; n < capture.count; n++) if (read_output(&capture.outputs[n])) EGL_FAIL(frame_error[0] ? frame_error : "cannot read output");
+    for (int n = 0; n < capture.count; n++) if (read_output(&capture.outputs[n], capture.outputs[n].pixels)) EGL_FAIL(frame_error[0] ? frame_error : "cannot read output");
+    long long area = 0;
+    for (int n = 0; n < capture.count; n++) area += (long long)capture.outputs[n].width * capture.outputs[n].height;
+    capture.covered = area == (long long)capture.width * capture.height;
+    /*
+     * Один монитор без масштаба: glReadPixels сразу в кадр сервера, без
+     * промежуточного буфера (на 4K это лишние 33 МБ копирования на кадр).
+     */
+    struct captured_output *single = &capture.outputs[0];
+    if (capture.count == 1 && !single->x && !single->y && single->width == single->native_width &&
+        single->height == single->native_height && single->width == capture.width) {
+        free(single->pixels);
+        single->pixels = NULL;
+    }
     printf("EGL DMA-BUF capture: %s, %.4s, modifier 0x%lx\n",
         eglQueryString(capture.display, EGL_VENDOR),
         (char *)&kmsvnc->drm->mfb->pixel_format, (unsigned long)kmsvnc->drm->mfb->modifier);
@@ -382,11 +398,18 @@ fail:
 void egl_capture_frame(const char *unused, int width, int height, char *output)
 {
     if (width != capture.width || height != capture.height) return;
-    memset(output, 0, (size_t)width * height * 4);
     int failed = 0;
+    if (capture.count == 1 && !capture.outputs[0].pixels) {
+        /* При ошибке в output остаётся прошлый снимок. */
+        failed = read_output(&capture.outputs[0], output);
+        if (failed && !capture.failed) fprintf(stderr, "EGL DMA-BUF frame read failed; preserving the last frame\n");
+        capture.failed = failed;
+        return;
+    }
+    if (!capture.covered) memset(output, 0, (size_t)width * height * 4);
     for (int n = 0; n < capture.count; n++) {
         struct captured_output *out = &capture.outputs[n];
-        failed |= read_output(out);
+        failed |= read_output(out, out->pixels);
         for (int y = 0; y < out->height; y++) {
             char *to = output + ((size_t)(out->y + y) * width + out->x) * 4;
             const char *from = out->pixels + (size_t)(y * (int64_t)out->native_height / out->height) * out->native_width * 4;
@@ -408,9 +431,16 @@ static rfbBool output_description(int index, rfbExtDesktopScreen *screen, rfbCli
 {
     if (index < 0 || index >= capture.count) return FALSE;
     const struct captured_output *out = &capture.outputs[index];
+    /* Клиенту с уменьшенным кадром (миниатюра, «живой» клиент) — его масштаб. */
+    int divisor = 1;
+    if (client && client->scaledScreen && client->scaledScreen->width > 0 &&
+        client->scaledScreen != client->screen) {
+        divisor = client->screen->width / client->scaledScreen->width;
+        if (divisor < 1) divisor = 1;
+    }
     screen->id = out->connector_id;
-    screen->x = out->x; screen->y = out->y;
-    screen->width = out->width; screen->height = out->height;
+    screen->x = out->x / divisor; screen->y = out->y / divisor;
+    screen->width = out->width / divisor; screen->height = out->height / divisor;
     screen->flags = 0;
     return TRUE;
 }
