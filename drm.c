@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
+#include <unistd.h>
 #include <libdrm/drm_fourcc.h>
 
 #include "drm.h"
@@ -119,7 +120,74 @@ void convert_intel_x_tiled_kmsbuf(const char *in, int width, int height, char *b
     convert_x_tiled(128, 8, in, width, height, buff);
 }
 
+/* GETFB2 выдаёт вызывающему собственные GEM handles: закрываем каждый уникальный. */
+static void close_fb_handles(drmModeFB2 *fb)
+{
+    for (int n = 0; n < 4; n++) {
+        if (!fb->handles[n]) continue;
+        int duplicate = 0;
+        for (int k = 0; k < n; k++) if (fb->handles[k] == fb->handles[n]) duplicate = 1;
+        if (!duplicate) {
+            struct drm_gem_close close_arg = { .handle = fb->handles[n] };
+            drmIoctl(kmsvnc->drm->drm_fd, DRM_IOCTL_GEM_CLOSE, &close_arg);
+        }
+    }
+}
+
+/*
+ * Буфер экрана меняется: Xorg и композиторы переключают буферы (page flip),
+ * создают новые при входе пользователя, смене режима, после DPMS. VAAPI
+ * импортирует один буфер, поэтому без этой проверки kmsvnc продолжал читать
+ * буфер, которого уже нет на экране, и отдавал застывшую картинку. При смене
+ * буфера поверхность VAAPI создаётся заново; буфер другого размера или
+ * формата не принимается (под них рассчитаны буферы VNC), остаётся последний
+ * кадр.
+ */
+static void vaapi_follow_framebuffer(void)
+{
+    static uint32_t rejected_fb = 0;
+    struct kmsvnc_drm_data *drm = kmsvnc->drm;
+    drmModePlane *plane = drmModeGetPlane(drm->drm_fd, drm->plane->plane_id);
+    if (!plane) return;
+    uint32_t fb_id = plane->fb_id;
+    drmModeFreePlane(plane);
+    /* Без буфера (DPMS) отдаём последний кадр. */
+    if (!fb_id || fb_id == drm->mfb->fb_id || fb_id == rejected_fb) return;
+    drmModeFB2 *fb = drmModeGetFB2(drm->drm_fd, fb_id);
+    if (!fb) return;
+    if (!fb->handles[0] || fb->width != drm->mfb->width || fb->height != drm->mfb->height ||
+        fb->pixel_format != drm->mfb->pixel_format) {
+        fprintf(stderr, "framebuffer %u: %ux%u fourcc %#x differs from %ux%u fourcc %#x, keeping the last frame\n",
+            fb_id, fb->width, fb->height, fb->pixel_format,
+            drm->mfb->width, drm->mfb->height, drm->mfb->pixel_format);
+        rejected_fb = fb_id;
+        close_fb_handles(fb);
+        drmModeFreeFB2(fb);
+        return;
+    }
+    int prime = -1;
+    if (drmPrimeHandleToFD(drm->drm_fd, fb->handles[0], O_RDWR, &prime) < 0 || prime < 0) {
+        fprintf(stderr, "framebuffer %u: PRIME export failed: %s\n", fb_id, strerror(errno));
+        rejected_fb = fb_id;
+        close_fb_handles(fb);
+        drmModeFreeFB2(fb);
+        return;
+    }
+    close(drm->prime_fd);
+    close_fb_handles(drm->mfb);
+    drmModeFreeFB2(drm->mfb);
+    drm->mfb = fb;
+    drm->prime_fd = drm->mmap_fd = prime;
+    rejected_fb = 0;
+    if (va_reimport()) {
+        /* Без поверхности снимать нечего: служба перезапустит kmsvnc. */
+        fprintf(stderr, "vaapi re-import of framebuffer %u failed, exiting\n", fb_id);
+        exit(1);
+    }
+}
+
 static void convert_vaapi(const char *in, int width, int height, char *buff) {
+    vaapi_follow_framebuffer();
     va_hwframe_to_vaapi(buff);
     if (
         (KMSVNC_FOURCC_TO_INT('R','G','B',0) & kmsvnc->va->selected_fmt->fourcc) == KMSVNC_FOURCC_TO_INT('R','G','B',0)
@@ -694,12 +762,24 @@ int drm_vendors() {
                 printf("warn: intel with CCS modifier detected, please set INTEL_DEBUG=noccs\n");
             }
         };
-        drm->funcs->convert = &convert_vaapi;
-        if (drm_kmsbuf_prime_vaapi()) return 1;
+        /*
+         * EGL читает текущий буфер плоскости на каждом кадре (как у NVIDIA),
+         * VAAPI — запасной путь: нет нужных расширений EGL или нельзя
+         * определить расположение нескольких мониторов.
+         */
+        if (!egl_capture_init(1)) {
+            drm->skip_map = 1;
+            drm->funcs->convert = egl_capture_frame;
+        }
+        else {
+            printf("falling back to vaapi capture\n");
+            drm->funcs->convert = &convert_vaapi;
+            if (drm_kmsbuf_prime_vaapi()) return 1;
+        }
     }
     else if (strcmp(driver_name, "nvidia-drm") == 0)
     {
-        if (egl_capture_init()) return 1;
+        if (egl_capture_init(0)) return 1;
         drm->skip_map = 1;
         drm->funcs->convert = egl_capture_frame;
     }

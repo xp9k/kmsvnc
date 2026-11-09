@@ -392,6 +392,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
 
 int main(int argc, char **argv)
 {
+    /* stdout службы идёт в журнал: без построчного буфера сведения о захвате
+       (буфер кадра, способ чтения) появлялись там только при остановке. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
     kmsvnc = malloc(sizeof(struct kmsvnc_data));
     if (!kmsvnc) KMSVNC_FATAL("memory allocation error at %s:%d\n", __FILE__, __LINE__);
     memset(kmsvnc, 0, sizeof(struct kmsvnc_data));

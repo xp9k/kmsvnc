@@ -7,13 +7,21 @@
 #include <va/va_drmcommon.h>
 #include <fcntl.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "va.h"
 #include "kmsvnc.h"
 
 extern struct kmsvnc_data *kmsvnc;
 
-void va_cleanup() {
+/* Повторный импорт при смене буфера экрана не повторяет сообщения запуска. */
+static int va_quiet = 0;
+#define VA_INFO(...) do { if (!va_quiet) printf(__VA_ARGS__); } while (0)
+
+static int va_import(void);
+
+/* Поверхность и образ кадра; дисплей VAAPI остаётся. */
+static void va_release_surface(void) {
     VAStatus s;
     if (kmsvnc->va) {
         if (kmsvnc->va->img_fmts) {
@@ -35,12 +43,24 @@ void va_cleanup() {
             VA_MAY(vaDestroySurfaces(kmsvnc->va->dpy, &kmsvnc->va->surface_id, 1));
             kmsvnc->va->surface_id = 0;
         }
+        kmsvnc->va->selected_fmt = NULL;
+        kmsvnc->va->derive_enabled = 0;
+    }
+}
+
+void va_cleanup() {
+    if (kmsvnc->va) {
+        va_release_surface();
         if (kmsvnc->va->dpy) {
             VA_MAY(vaTerminate(kmsvnc->va->dpy));
             kmsvnc->va->dpy = NULL;
         }
         if (kmsvnc->va->vendor_string) {
             kmsvnc->va->vendor_string = NULL;
+        }
+        if (kmsvnc->va->render_node_fd > 0) {
+            close(kmsvnc->va->render_node_fd);
+            kmsvnc->va->render_node_fd = 0;
         }
         free(kmsvnc->va);
         kmsvnc->va = NULL;
@@ -94,7 +114,7 @@ static VAImageFormat* vaImgFmt_apply_quirks(struct va_fmt_data* data) {
     static VAImageFormat ret = {0};
     memcpy(&ret, data->fmt, sizeof(VAImageFormat));
     if ((kmsvnc->va_byteorder_swap ^ !strncmp(kmsvnc->va->vendor_string, "Mesa", 4)) && data->depth != 30) {
-        printf("applying rgb mask byte order swap\n");
+        VA_INFO("applying rgb mask byte order swap\n");
         ret.blue_mask = __builtin_bswap32(data->fmt->blue_mask);
         ret.green_mask = __builtin_bswap32(data->fmt->green_mask);
         ret.red_mask = __builtin_bswap32(data->fmt->red_mask);
@@ -103,6 +123,7 @@ static VAImageFormat* vaImgFmt_apply_quirks(struct va_fmt_data* data) {
 }
 
 static void print_va_image_fmt(VAImageFormat *fmt) {
+    if (va_quiet) return;
     printf("image fmt: fourcc %d, %s, byte_order %s, bpp %d, depth %d, blue_mask %#x, green_mask %#x, red_mask %#x, alpha_mask %#x, reserved %#x %#x %#x %#x\n", fmt->fourcc,
         fourcc_to_str(fmt->fourcc),
         fmt->byte_order == 1 ? "VA_LSB_FIRST" : "VA_MSB_FIRST",
@@ -158,12 +179,28 @@ int va_init() {
     vaSetInfoCallback(va->dpy, &va_msg_callback, NULL);
 
     int major, minor;
-    VAStatus status;
     VA_MUST(vaInitialize(va->dpy, &major, &minor));
 
     va->vendor_string = vaQueryVendorString(va->dpy);
     printf("vaapi vendor %s\n", va->vendor_string);
 
+    return va_import();
+}
+
+/* Повторный импорт текущего kmsvnc->drm->mfb (буфер экрана сменился). */
+int va_reimport(void) {
+    if (!kmsvnc->va || !kmsvnc->va->dpy) return 1;
+    va_quiet = 1;
+    va_release_surface();
+    int failed = va_import();
+    va_quiet = 0;
+    if (failed) va_release_surface();
+    return failed;
+}
+
+/* Поверхность VAAPI из PRIME-буфера кадра и образ для чтения пикселей. */
+static int va_import(void) {
+    struct kmsvnc_va_data *va = kmsvnc->va;
     VADRMPRIMESurfaceDescriptor prime_desc;
     VASurfaceAttrib prime_attrs[2] = {
         {
@@ -231,7 +268,7 @@ int va_init() {
                             kmsvnc->drm->mfb->width, kmsvnc->drm->mfb->height, &va->surface_id, 1,
                             prime_attrs, KMSVNC_ARRAY_ELEMENTS(prime_attrs))) != VA_STATUS_SUCCESS)
     {
-        printf("vaCreateSurfaces prime2 error %#x %s, trying prime\n", s, vaErrorStr(s));
+        VA_INFO("vaCreateSurfaces prime2 error %#x %s, trying prime\n", s, vaErrorStr(s));
 
         VASurfaceAttribExternalBuffers buffer_desc;
         VASurfaceAttrib buffer_attrs[2] = {
@@ -279,7 +316,7 @@ int va_init() {
         int got;
         vaQueryImageFormats(va->dpy, va->img_fmts, &got);
         if (got != va->img_fmt_count) {
-            printf("got less VAImageFormats, %d instead of %d\n", got, va->img_fmt_count);
+            VA_INFO("got less VAImageFormats, %d instead of %d\n", got, va->img_fmt_count);
             va->img_fmt_count = got;
         }
     }
@@ -382,7 +419,7 @@ int va_init() {
             KMSVNC_FATAL("failed to get vaapi image\n");
         }
     }
-    printf("got vaapi %simage:\n", va->derive_enabled ? "derive " : "");
+    VA_INFO("got vaapi %simage:\n", va->derive_enabled ? "derive " : "");
     print_va_image_fmt(&va->image->format);
     if (kmsvnc->debug_enabled) {
         fprintf(stderr, "selected image format:\n");

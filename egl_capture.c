@@ -28,6 +28,7 @@ struct captured_output {
 
 static struct {
     struct gbm_device *gbm;
+    int gbm_fd;
     EGLDisplay display;
     EGLContext context;
     GLuint texture;
@@ -67,6 +68,7 @@ void egl_capture_cleanup(void)
         eglTerminate(capture.display);
     }
     if (capture.gbm) gbm_device_destroy(capture.gbm);
+    if (capture.gbm_fd > 0) close(capture.gbm_fd);
     for (int n = 0; n < capture.count; n++) free(capture.outputs[n].pixels);
     memset(&capture, 0, sizeof(capture));
 }
@@ -85,35 +87,72 @@ static void close_handles(drmModeFB2 *fb)
     }
 }
 
+/* Ключи атрибутов EGL для каждой плоскости буфера. */
+static const EGLint plane_keys[4][5] = {
+    { EGL_DMA_BUF_PLANE0_FD_EXT, EGL_DMA_BUF_PLANE0_OFFSET_EXT, EGL_DMA_BUF_PLANE0_PITCH_EXT,
+      EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT },
+    { EGL_DMA_BUF_PLANE1_FD_EXT, EGL_DMA_BUF_PLANE1_OFFSET_EXT, EGL_DMA_BUF_PLANE1_PITCH_EXT,
+      EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT, EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT },
+    { EGL_DMA_BUF_PLANE2_FD_EXT, EGL_DMA_BUF_PLANE2_OFFSET_EXT, EGL_DMA_BUF_PLANE2_PITCH_EXT,
+      EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT, EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT },
+    { EGL_DMA_BUF_PLANE3_FD_EXT, EGL_DMA_BUF_PLANE3_OFFSET_EXT, EGL_DMA_BUF_PLANE3_PITCH_EXT,
+      EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT, EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT },
+};
+
+/* Причина последней неудачи чтения кадра (для журнала). */
+static char frame_error[128];
+
 static int read_frame(drmModeFB2 *fb, char *output)
 {
-    int prime = -1;
-    if (!fb->handles[0] || fb->handles[1] ||
-        drmPrimeHandleToFD(kmsvnc->drm->drm_fd, fb->handles[0], O_CLOEXEC, &prime)) return 1;
-    const EGLint attributes[] = {
-        EGL_WIDTH, fb->width, EGL_HEIGHT, fb->height,
-        EGL_LINUX_DRM_FOURCC_EXT, fb->pixel_format,
-        EGL_DMA_BUF_PLANE0_FD_EXT, prime,
-        EGL_DMA_BUF_PLANE0_OFFSET_EXT, fb->offsets[0],
-        EGL_DMA_BUF_PLANE0_PITCH_EXT, fb->pitches[0],
-        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint)(fb->modifier & 0xffffffff),
-        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint)(fb->modifier >> 32),
-        EGL_NONE,
-    };
-    EGLImageKHR image = capture.create_image(capture.display, EGL_NO_CONTEXT,
-        EGL_LINUX_DMA_BUF_EXT, NULL, attributes);
-    close(prime);
-    if (image == EGL_NO_IMAGE_KHR) return 1;
+    /*
+     * У Intel со сжатием (CCS) у буфера несколько плоскостей, часто с общим
+     * GEM handle: каждая плоскость получает свой PRIME fd того же dma-buf.
+     */
+    int primes[4] = { -1, -1, -1, -1 };
+    EGLint attributes[6 + 4 * 10 + 1];
+    int count = 0, planes = 0;
+    attributes[count++] = EGL_WIDTH; attributes[count++] = fb->width;
+    attributes[count++] = EGL_HEIGHT; attributes[count++] = fb->height;
+    attributes[count++] = EGL_LINUX_DRM_FOURCC_EXT; attributes[count++] = fb->pixel_format;
+    for (; planes < 4 && fb->handles[planes]; planes++) {
+        if (drmPrimeHandleToFD(kmsvnc->drm->drm_fd, fb->handles[planes], O_CLOEXEC, &primes[planes])) break;
+        attributes[count++] = plane_keys[planes][0]; attributes[count++] = primes[planes];
+        attributes[count++] = plane_keys[planes][1]; attributes[count++] = fb->offsets[planes];
+        attributes[count++] = plane_keys[planes][2]; attributes[count++] = fb->pitches[planes];
+        attributes[count++] = plane_keys[planes][3]; attributes[count++] = (EGLint)(fb->modifier & 0xffffffff);
+        attributes[count++] = plane_keys[planes][4]; attributes[count++] = (EGLint)(fb->modifier >> 32);
+    }
+    attributes[count] = EGL_NONE;
+    int exported = planes && (planes == 4 || !fb->handles[planes]);
+    EGLImageKHR image = exported ? capture.create_image(capture.display, EGL_NO_CONTEXT,
+        EGL_LINUX_DMA_BUF_EXT, NULL, attributes) : EGL_NO_IMAGE_KHR;
+    EGLint image_error = image == EGL_NO_IMAGE_KHR ? eglGetError() : EGL_SUCCESS;
+    for (int n = 0; n < 4; n++) if (primes[n] >= 0) close(primes[n]);
+    if (!exported) {
+        snprintf(frame_error, sizeof(frame_error), "PRIME export of plane %d failed: %s", planes, strerror(errno));
+        return 1;
+    }
+    if (image == EGL_NO_IMAGE_KHR) {
+        snprintf(frame_error, sizeof(frame_error), "eglCreateImage failed (EGL 0x%x, fourcc %.4s, modifier 0x%llx, planes %d)",
+            image_error, (char *)&fb->pixel_format, (unsigned long long)fb->modifier, planes);
+        return 1;
+    }
     glBindTexture(GL_TEXTURE_2D, capture.texture);
     capture.bind_image(GL_TEXTURE_2D, image);
     glBindFramebuffer(GL_FRAMEBUFFER, capture.framebuffer);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, capture.texture, 0);
-    int failed = glGetError() != GL_NO_ERROR ||
-        glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE;
-    if (!failed) {
+    GLenum gl_error = glGetError();
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    int failed = gl_error != GL_NO_ERROR || status != GL_FRAMEBUFFER_COMPLETE;
+    if (failed) {
+        snprintf(frame_error, sizeof(frame_error), "framebuffer not usable (GL 0x%x, status 0x%x)", gl_error, status);
+    }
+    else {
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
         glReadPixels(0, 0, fb->width, fb->height, GL_RGBA, GL_UNSIGNED_BYTE, output);
-        failed = glGetError() != GL_NO_ERROR;
+        gl_error = glGetError();
+        failed = gl_error != GL_NO_ERROR;
+        if (failed) snprintf(frame_error, sizeof(frame_error), "glReadPixels failed (GL 0x%x)", gl_error);
     }
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
     capture.destroy_image(capture.display, image);
@@ -267,41 +306,65 @@ static int read_output(struct captured_output *out)
     return failed;
 }
 
-int egl_capture_init(void)
+/* Render node устройства (как у VAAPI), иначе сама карта, но с правом записи. */
+static int open_gbm_device(void)
 {
+    char *render_node = drmGetRenderDeviceNameFromFd(kmsvnc->drm->drm_fd);
+    int fd = render_node ? open(render_node, O_RDWR | O_CLOEXEC) : -1;
+    free(render_node);
+    if (fd < 0) fd = open(kmsvnc->card, O_RDWR | O_CLOEXEC);
+    return fd;
+}
+
+int egl_capture_init(int own_device)
+{
+    const char *reason = "unknown";
+#define EGL_FAIL(why) do { reason = (why); goto fail; } while (0)
     PFNEGLGETPLATFORMDISPLAYEXTPROC get_display =
         (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
     capture.create_image = (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
     capture.destroy_image = (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
     capture.bind_image = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
-    if (!get_display || !capture.create_image || !capture.destroy_image || !capture.bind_image) goto fail;
-    capture.gbm = gbm_create_device(kmsvnc->drm->drm_fd);
-    if (!capture.gbm) goto fail;
+    if (!get_display || !capture.create_image || !capture.destroy_image || !capture.bind_image) EGL_FAIL("EGL/GLES entry points missing");
+    if (own_device) {
+        capture.gbm_fd = open_gbm_device();
+        if (capture.gbm_fd < 0) EGL_FAIL("cannot open render node for writing");
+    }
+    capture.gbm = gbm_create_device(own_device ? capture.gbm_fd : kmsvnc->drm->drm_fd);
+    if (!capture.gbm) EGL_FAIL("gbm_create_device failed");
     capture.display = get_display(EGL_PLATFORM_GBM_KHR, capture.gbm, NULL);
-    if (capture.display == EGL_NO_DISPLAY || !eglInitialize(capture.display, NULL, NULL)) goto fail;
+    if (capture.display == EGL_NO_DISPLAY || !eglInitialize(capture.display, NULL, NULL)) EGL_FAIL("eglInitialize failed");
     const char *extensions = eglQueryString(capture.display, EGL_EXTENSIONS);
     if (!extension(extensions, "EGL_EXT_image_dma_buf_import") ||
         !extension(extensions, "EGL_EXT_image_dma_buf_import_modifiers") ||
-        !extension(extensions, "EGL_KHR_surfaceless_context")) goto fail;
-    if (!eglBindAPI(EGL_OPENGL_ES_API)) goto fail;
-    const EGLint config_attributes[] = {
+        !extension(extensions, "EGL_KHR_surfaceless_context")) EGL_FAIL("EGL dma-buf import or surfaceless extensions missing");
+    if (!eglBindAPI(EGL_OPENGL_ES_API)) EGL_FAIL("eglBindAPI failed");
+    /*
+     * Контекст без поверхности, конфигурация нужна только для его создания.
+     * У Mesa на платформе GBM конфигураций pbuffer нет, поэтому вторая
+     * попытка — любая конфигурация GLES2 (маска 0 подходит всем).
+     */
+    EGLint config_attributes[] = {
         EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
         EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_NONE,
     };
     EGLConfig config;
-    EGLint count;
-    if (!eglChooseConfig(capture.display, config_attributes, &config, 1, &count) || !count) goto fail;
+    EGLint count = 0;
+    if (!eglChooseConfig(capture.display, config_attributes, &config, 1, &count) || !count) {
+        config_attributes[1] = 0;
+        if (!eglChooseConfig(capture.display, config_attributes, &config, 1, &count) || !count) EGL_FAIL("no EGL config");
+    }
     const EGLint context_attributes[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
     capture.context = eglCreateContext(capture.display, config, EGL_NO_CONTEXT, context_attributes);
     if (capture.context == EGL_NO_CONTEXT ||
-        !eglMakeCurrent(capture.display, EGL_NO_SURFACE, EGL_NO_SURFACE, capture.context)) goto fail;
+        !eglMakeCurrent(capture.display, EGL_NO_SURFACE, EGL_NO_SURFACE, capture.context)) EGL_FAIL("cannot create EGL context");
     glGenTextures(1, &capture.texture);
     glGenFramebuffers(1, &capture.framebuffer);
-    if (glGetError() != GL_NO_ERROR) goto fail;
+    if (glGetError() != GL_NO_ERROR) EGL_FAIL("GL texture/framebuffer setup failed");
     /* Проверяем импорт каждого выхода до открытия VNC-порта. */
-    if (prepare_outputs()) goto fail;
-    for (int n = 0; n < capture.count; n++) if (read_output(&capture.outputs[n])) goto fail;
+    if (prepare_outputs()) EGL_FAIL("no capturable outputs or unknown monitor layout");
+    for (int n = 0; n < capture.count; n++) if (read_output(&capture.outputs[n])) EGL_FAIL(frame_error[0] ? frame_error : "cannot read output");
     printf("EGL DMA-BUF capture: %s, %.4s, modifier 0x%lx\n",
         eglQueryString(capture.display, EGL_VENDOR),
         (char *)&kmsvnc->drm->mfb->pixel_format, (unsigned long)kmsvnc->drm->mfb->modifier);
@@ -310,8 +373,8 @@ int egl_capture_init(void)
     kmsvnc->drm->mmap_size = (size_t)capture.width * capture.height * 4;
     return 0;
 fail:
-    fprintf(stderr, "EGL DMA-BUF capture initialization failed (EGL 0x%x, GL 0x%x)\n",
-        eglGetError(), capture.context != EGL_NO_CONTEXT ? glGetError() : 0);
+#undef EGL_FAIL
+    fprintf(stderr, "EGL DMA-BUF capture initialization failed: %s (EGL 0x%x)\n", reason, eglGetError());
     egl_capture_cleanup();
     return 1;
 }

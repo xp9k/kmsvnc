@@ -266,29 +266,19 @@ void rfb_ptr_hook(int mask, int screen_x, int screen_y, rfbClientPtr cl)
     pthread_mutex_unlock(&input_lock);
 }
 
+/*
+ * Пробуждение экрана нажатием левого Shift. Прежнее перемещение абсолютной
+ * мыши ставило курсор в (0, 0) — горячий угол KWin, и каждый запуск службы
+ * (установка, смена пароля, перезапуск) открывал на экране обзор окон.
+ * Одиночное нажатие Shift будит экран и ничего не делает в сеансе.
+ */
 static void wake_system_up()
 {
     struct input_event ies1[] = {
-        {
-            .type = EV_ABS,
-            .code = ABS_X,
-            .value = 1,
-        },
-        {
-            .type = EV_SYN,
-            .code = SYN_REPORT,
-            .value = 0,
-        },
-        {
-            .type = EV_ABS,
-            .code = ABS_X,
-            .value = 0,
-        },
-        {
-            .type = EV_SYN,
-            .code = SYN_REPORT,
-            .value = 0,
-        },
+        { .type = EV_KEY, .code = KEY_LEFTSHIFT, .value = 1 },
+        { .type = EV_SYN, .code = SYN_REPORT, .value = 0 },
+        { .type = EV_KEY, .code = KEY_LEFTSHIFT, .value = 0 },
+        { .type = EV_SYN, .code = SYN_REPORT, .value = 0 },
     };
     for (int i = 0; i < KMSVNC_ARRAY_ELEMENTS(ies1); i++)
     {
