@@ -4,7 +4,7 @@ VNC-сервер для GNU/Linux, написанный на C. Захватыв
 и передаёт ввод через uinput. Работает в X11 и Wayland, включая экран входа.
 
 Форк [isjerryxiao/kmsvnc](https://github.com/isjerryxiao/kmsvnc).
-Лицензия GPLv3 — [LICENSE](LICENSE).
+Лицензия GPLv3 - [LICENSE](LICENSE).
 
 ## Сборка
 
@@ -26,7 +26,7 @@ sudo kmsvnc -w -p 5900 -d /dev/dri/card0 --password-file /etc/kmsvnc/passwd
 ```
 
 Файл пароля должен быть доступен только root. VNC-аутентификация использует
-первые восемь символов. Полный список параметров — `kmsvnc --help`.
+первые восемь символов. Полный список параметров - `kmsvnc --help`.
 
 ## Мониторы
 

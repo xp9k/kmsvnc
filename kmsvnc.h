@@ -119,6 +119,12 @@ struct kmsvnc_drm_data
     char *cursor_mapped;
     size_t cursor_mmap_size;
     char skip_map;
+    /* Путь mmap (ВМ, неизвестные драйверы): буфер экрана отображён один раз, drm_follow_framebuffer
+       переотображает его при смене. dumb_handle - GEM handle текущего отображения. */
+    char dumb_follow;
+    uint32_t dumb_handle;
+    /* Экран без буфера дольше SCREEN_OFF_BLANK_MS: вместо последнего кадра отдаётся чёрный. */
+    char off_blank;
     struct kmsvnc_drm_funcs *funcs;
     char *pixfmt_name;
     char *mod_vendor;
@@ -145,6 +151,19 @@ struct kmsvnc_va_data
     VAImageFormat* selected_fmt;
     const char *vendor_string;
 };
+
+#define KMSVNC_NS_IN_MS 1000000LL
+/*
+ * Экран без буфера (выключен, DPMS, смена сеанса: выход пользователя) сначала держит последний кадр
+ * (буфер может пропасть на миг при смене режима), через SCREEN_OFF_BLANK_MS отдаётся чёрным: иначе
+ * миниатюра и окно VNC показывали бы рабочий стол вышедшего пользователя, пока экран не проснётся.
+ * Буфер, который нельзя прочитать (экран входа в другом режиме, смена выходов), дольше
+ * CAPTURE_STUCK_RESTART_MS приводит к перезапуску: служба запускает kmsvnc с новой геометрией.
+ */
+#define SCREEN_OFF_BLANK_MS 2000
+#define CAPTURE_STUCK_RESTART_MS 3000
+long long kmsvnc_now_ns(void);
+void kmsvnc_restart(const char *reason);
 
 /* Разбудить цикл захвата: запрос кадра или ввод/новый клиент (выход из простоя). */
 #define CAPTURE_WAKE_REQUEST 1

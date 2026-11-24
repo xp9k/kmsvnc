@@ -135,24 +135,80 @@ static void close_fb_handles(drmModeFB2 *fb)
 }
 
 /*
- * Буфер экрана меняется: Xorg и композиторы переключают буферы (page flip),
- * создают новые при входе пользователя, смене режима, после DPMS. VAAPI
- * импортирует один буфер, поэтому без этой проверки kmsvnc продолжал читать
- * буфер, которого уже нет на экране, и отдавал застывшую картинку. При смене
- * буфера поверхность VAAPI создаётся заново; буфер другого размера или
- * формата не принимается (под них рассчитаны буферы VNC), остаётся последний
- * кадр.
+ * Слежение за буфером экрана общее для путей VAAPI и mmap (EGL читает текущий буфер сам).
+ * Экран без буфера (выключен, DPMS, смена сеанса) сначала держит последний кадр - буфер может
+ * пропасть на миг, - через SCREEN_OFF_BLANK_MS drm->off_blank просит главный цикл отдать чёрный
+ * кадр. Буфер, который нельзя принять (другой режим экрана входа), дольше CAPTURE_STUCK_RESTART_MS
+ * приводит к перезапуску kmsvnc службой с новой геометрией.
+ */
+/*
+ * Время считается от последнего снимка с буфером, а не от первого наблюдения пустого экрана:
+ * без клиентов экран не снимается, и разовый снимок (первая миниатюра после долгого простоя)
+ * иначе всегда попадал бы в льготный период и показывал старый кадр.
+ */
+static void track_screen_off(int off)
+{
+    static long long last_seen = 0;
+    long long now = kmsvnc_now_ns();
+    if (!last_seen || !off) {
+        last_seen = now;
+        kmsvnc->drm->off_blank = 0;
+        return;
+    }
+    kmsvnc->drm->off_blank = now - last_seen >= SCREEN_OFF_BLANK_MS * KMSVNC_NS_IN_MS;
+}
+
+/* Перезапуск: буфер нечитаем два снимка подряд и последний хороший снимок был не меньше CAPTURE_STUCK_RESTART_MS назад. */
+static void track_stuck(int stuck, uint32_t fb_id, const char *why)
+{
+    static long long last_good = 0;
+    static int failures = 0;
+    long long now = kmsvnc_now_ns();
+    if (!last_good || !stuck) {
+        last_good = now;
+        failures = 0;
+        return;
+    }
+    if (++failures >= 2 && now - last_good >= CAPTURE_STUCK_RESTART_MS * KMSVNC_NS_IN_MS) {
+        char reason[160];
+        snprintf(reason, sizeof(reason), "framebuffer %u cannot be captured (%s)", fb_id, why);
+        kmsvnc_restart(reason);
+    }
+}
+
+/* Текущий буфер основной плоскости или 0, если на плоскости нет буфера. */
+static uint32_t plane_fb_id(void)
+{
+    drmModePlane *plane = drmModeGetPlane(kmsvnc->drm->drm_fd, kmsvnc->drm->plane->plane_id);
+    if (!plane) return UINT32_MAX;
+    uint32_t fb_id = plane->fb_id;
+    drmModeFreePlane(plane);
+    return fb_id;
+}
+
+/*
+ * Буфер экрана меняется: Xorg и композиторы переключают буферы (page flip), создают новые при
+ * входе пользователя, смене режима, после DPMS. VAAPI импортирует один буфер, поэтому без этой
+ * проверки kmsvnc продолжал читать буфер, которого уже нет на экране, и отдавал застывшую
+ * картинку. При смене буфера поверхность VAAPI создаётся заново; буфер другого размера или
+ * формата не принимается (под них рассчитаны буферы VNC): остаётся последний кадр, а если так
+ * дольше CAPTURE_STUCK_RESTART_MS - перезапуск.
  */
 static void vaapi_follow_framebuffer(void)
 {
     static uint32_t rejected_fb = 0;
     struct kmsvnc_drm_data *drm = kmsvnc->drm;
-    drmModePlane *plane = drmModeGetPlane(drm->drm_fd, drm->plane->plane_id);
-    if (!plane) return;
-    uint32_t fb_id = plane->fb_id;
-    drmModeFreePlane(plane);
-    /* Без буфера (DPMS) отдаём последний кадр. */
-    if (!fb_id || fb_id == drm->mfb->fb_id || fb_id == rejected_fb) return;
+    uint32_t fb_id = plane_fb_id();
+    if (fb_id == UINT32_MAX) return;
+    track_screen_off(!fb_id);
+    if (!fb_id || fb_id == drm->mfb->fb_id) {
+        track_stuck(0, 0, NULL);
+        return;
+    }
+    if (fb_id == rejected_fb) {
+        track_stuck(1, fb_id, "size or format differs");
+        return;
+    }
     drmModeFB2 *fb = drmModeGetFB2(drm->drm_fd, fb_id);
     if (!fb) return;
     if (!fb->handles[0] || fb->width != drm->mfb->width || fb->height != drm->mfb->height ||
@@ -163,6 +219,7 @@ static void vaapi_follow_framebuffer(void)
         rejected_fb = fb_id;
         close_fb_handles(fb);
         drmModeFreeFB2(fb);
+        track_stuck(1, fb_id, "size or format differs");
         return;
     }
     int prime = -1;
@@ -171,6 +228,7 @@ static void vaapi_follow_framebuffer(void)
         rejected_fb = fb_id;
         close_fb_handles(fb);
         drmModeFreeFB2(fb);
+        track_stuck(1, fb_id, "PRIME export failed");
         return;
     }
     close(drm->prime_fd);
@@ -179,6 +237,7 @@ static void vaapi_follow_framebuffer(void)
     drm->mfb = fb;
     drm->prime_fd = drm->mmap_fd = prime;
     rejected_fb = 0;
+    track_stuck(0, 0, NULL);
     if (va_reimport()) {
         /* Без поверхности снимать нечего: служба перезапустит kmsvnc. */
         fprintf(stderr, "vaapi re-import of framebuffer %u failed, exiting\n", fb_id);
@@ -187,7 +246,6 @@ static void vaapi_follow_framebuffer(void)
 }
 
 static void convert_vaapi(const char *in, int width, int height, char *buff) {
-    vaapi_follow_framebuffer();
     va_hwframe_to_vaapi(buff);
     if (
         (KMSVNC_FOURCC_TO_INT('R','G','B',0) & kmsvnc->va->selected_fmt->fourcc) == KMSVNC_FOURCC_TO_INT('R','G','B',0)
@@ -228,6 +286,91 @@ static void convert_vaapi(const char *in, int width, int height, char *buff) {
             }
         }
     }
+}
+
+static void gem_close(uint32_t handle)
+{
+    struct drm_gem_close close_arg = { .handle = handle };
+    drmIoctl(kmsvnc->drm->drm_fd, DRM_IOCTL_GEM_CLOSE, &close_arg);
+}
+
+/* Отображает буфер fb (dumb) вместо текущего. Ошибка - 1, прежнее отображение не тронуто. */
+static int dumb_remap(drmModeFB2 *fb)
+{
+    struct kmsvnc_drm_data *drm = kmsvnc->drm;
+    struct drm_gem_flink flink = { .handle = fb->handles[0] };
+    if (drmIoctl(drm->drm_fd, DRM_IOCTL_GEM_FLINK, &flink)) return 1;
+    struct drm_gem_open open_arg = { .name = flink.name };
+    if (drmIoctl(drm->drm_fd, DRM_IOCTL_GEM_OPEN, &open_arg)) return 1;
+    struct drm_mode_map_dumb mreq;
+    memset(&mreq, 0, sizeof(mreq));
+    mreq.handle = open_arg.handle;
+    if (drmIoctl(drm->drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq)) {
+        gem_close(open_arg.handle);
+        return 1;
+    }
+    void *mapped = mmap(NULL, open_arg.size, PROT_READ, MAP_SHARED, drm->mmap_fd, mreq.offset);
+    if (mapped == MAP_FAILED) {
+        gem_close(open_arg.handle);
+        return 1;
+    }
+    if (drm->mapped) munmap(drm->mapped, drm->mmap_size);
+    if (drm->dumb_handle) gem_close(drm->dumb_handle);
+    drm->mapped = mapped;
+    drm->mmap_size = open_arg.size;
+    drm->mmap_offset = mreq.offset;
+    drm->dumb_handle = open_arg.handle;
+    return 0;
+}
+
+/*
+ * Путь mmap (ВМ и неизвестные драйверы) читал буфер, отображённый при запуске, и после выхода
+ * пользователя (сервер экрана перезапускается, буфер новый) продолжал показывать его рабочий
+ * стол. Теперь при смене буфера он отображается заново; буфер другого размера, формата или
+ * шага строки не принимается (под них рассчитаны буферы VNC): последний кадр, а при
+ * CAPTURE_STUCK_RESTART_MS - перезапуск службой с новой геометрией.
+ */
+static void dumb_follow_framebuffer(void)
+{
+    struct kmsvnc_drm_data *drm = kmsvnc->drm;
+    uint32_t fb_id = plane_fb_id();
+    if (fb_id == UINT32_MAX) return;
+    track_screen_off(!fb_id);
+    if (!fb_id || fb_id == drm->mfb->fb_id) {
+        track_stuck(0, 0, NULL);
+        return;
+    }
+    drmModeFB2 *fb = drmModeGetFB2(drm->drm_fd, fb_id);
+    if (!fb) return;
+    if (!fb->handles[0] || fb->width != drm->mfb->width || fb->height != drm->mfb->height ||
+        fb->pixel_format != drm->mfb->pixel_format || fb->pitches[0] != drm->mfb->pitches[0]) {
+        close_fb_handles(fb);
+        drmModeFreeFB2(fb);
+        track_stuck(1, fb_id, "size, format or pitch differs");
+        return;
+    }
+    if (dumb_remap(fb)) {
+        close_fb_handles(fb);
+        drmModeFreeFB2(fb);
+        char reason[96];
+        snprintf(reason, sizeof(reason), "cannot map framebuffer %u: %s", fb_id, strerror(errno));
+        kmsvnc_restart(reason);
+    }
+    close_fb_handles(drm->mfb);
+    drmModeFreeFB2(drm->mfb);
+    close_fb_handles(fb);
+    drm->mfb = fb;
+    track_stuck(0, 0, NULL);
+}
+
+void drm_follow_framebuffer(void)
+{
+    struct kmsvnc_drm_data *drm = kmsvnc->drm;
+    if (drm->skip_map) {
+        if (drm->funcs->convert == &convert_vaapi) vaapi_follow_framebuffer();
+        return;
+    }
+    if (drm->dumb_follow) dumb_follow_framebuffer();
 }
 
 static inline void drm_sync(int drmfd, uint64_t flags)
@@ -740,6 +883,8 @@ static int drm_kmsbuf_dumb() {
 
     drm->mmap_size = open_arg.size;
     drm->mmap_offset = mreq.offset;
+    drm->dumb_handle = open_arg.handle;
+    drm->dumb_follow = 1;
     return 0;
 }
 
@@ -764,7 +909,7 @@ int drm_vendors() {
         };
         /*
          * EGL читает текущий буфер плоскости на каждом кадре (как у NVIDIA),
-         * VAAPI — запасной путь: нет нужных расширений EGL или нельзя
+         * VAAPI - запасной путь: нет нужных расширений EGL или нельзя
          * определить расположение нескольких мониторов.
          */
         if (!egl_capture_init(1)) {

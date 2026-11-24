@@ -24,6 +24,11 @@ struct captured_output {
     int x, y, width, height;
     int native_width, native_height;
     char *pixels;
+    /* Последний снимок выхода с буфером и последний успешный; подряд неудачных снимков. Время от
+       последнего снимка, а не от первого наблюдения: без клиентов экран не снимается (drm.c). */
+    long long last_fb;
+    long long last_good;
+    int failures;
 };
 
 static struct {
@@ -290,23 +295,123 @@ static int prepare_outputs(void)
     return 0;
 }
 
-/* Читает текущий буфер выхода в dest (out->pixels или сразу кадр сервера). */
+/*
+ * Читает текущий буфер выхода в dest (out->pixels или сразу кадр сервера).
+ * Выход без буфера (экран выключен, смена сеанса: выход пользователя) сначала оставляет
+ * последний кадр - буфер может пропасть на миг, - а если буфера не было дольше
+ * SCREEN_OFF_BLANK_MS с последнего снимка, отдаётся чёрным: иначе миниатюра показывала бы рабочий
+ * стол ушедшего пользователя, пока экран не проснётся.
+ */
 static int read_output(struct captured_output *out, char *dest)
 {
     int fd = kmsvnc->drm->drm_fd;
     drmModePlane *plane = drmModeGetPlane(fd, out->plane_id);
-    if (!plane) return 1;
+    long long now = kmsvnc_now_ns();
+    if (!out->last_fb) out->last_fb = out->last_good = now;
+    if (!plane) {
+        snprintf(frame_error, sizeof(frame_error), "plane %u is gone", out->plane_id);
+        out->failures++;
+        return 1;
+    }
     uint32_t fb_id = plane->fb_id;
     drmModeFreePlane(plane);
-    /* При DPMS оставляем последний кадр именно этого монитора. */
-    if (!fb_id) return 0;
+    if (!fb_id) {
+        if (now - out->last_fb >= SCREEN_OFF_BLANK_MS * KMSVNC_NS_IN_MS)
+            memset(dest, 0, (size_t)out->native_width * out->native_height * 4);
+        out->last_good = now;
+        out->failures = 0;
+        return 0;
+    }
+    out->last_fb = now;
     drmModeFB2 *fb = drmModeGetFB2(fd, fb_id);
-    if (!fb) return 1;
-    int failed = fb->width != out->native_width || fb->height != out->native_height ||
-        read_frame(fb, dest);
-    close_handles(fb);
-    drmModeFreeFB2(fb);
+    int failed;
+    if (!fb) {
+        snprintf(frame_error, sizeof(frame_error), "framebuffer %u is not readable", fb_id);
+        failed = 1;
+    }
+    else {
+        if (fb->width != out->native_width || fb->height != out->native_height) {
+            snprintf(frame_error, sizeof(frame_error), "framebuffer %ux%u differs from the captured %dx%d",
+                fb->width, fb->height, out->native_width, out->native_height);
+            failed = 1;
+        }
+        else failed = read_frame(fb, dest);
+        close_handles(fb);
+        drmModeFreeFB2(fb);
+    }
+    if (failed) {
+        out->failures++;
+    }
+    else {
+        out->last_good = now;
+        out->failures = 0;
+    }
     return failed;
+}
+
+/*
+ * Состав включённых выходов изменился (после выхода пользователя экран входа может занять другие
+ * плоскости или мониторы): прежние выходы читать нечем. Проверка нужна, только пока выход без
+ * буфера или нечитаем.
+ */
+static int outputs_changed(void)
+{
+    int fd = kmsvnc->drm->drm_fd;
+    drmModeRes *resources = drmModeGetResources(fd);
+    drmModePlaneRes *planes = drmModeGetPlaneResources(fd);
+    if (!resources || !planes) {
+        if (resources) drmModeFreeResources(resources);
+        if (planes) drmModeFreePlaneResources(planes);
+        return 0;
+    }
+    int active = 0, changed = 0;
+    for (int n = 0; n < resources->count_connectors; n++) {
+        drmModeConnector *connector = drmModeGetConnector(fd, resources->connectors[n]);
+        if (!connector) continue;
+        drmModeEncoder *encoder = connector->encoder_id ? drmModeGetEncoder(fd, connector->encoder_id) : NULL;
+        if (connector->connection == DRM_MODE_CONNECTED && encoder && encoder->crtc_id) {
+            for (int k = 0; k < planes->count_planes; k++) {
+                drmModePlane *plane = drmModeGetPlane(fd, planes->planes[k]);
+                if (!plane) continue;
+                if (plane->crtc_id == encoder->crtc_id && plane->fb_id && primary_plane(plane)) {
+                    active++;
+                    int known = 0;
+                    for (int m = 0; m < capture.count; m++) if (capture.outputs[m].plane_id == plane->plane_id) known = 1;
+                    if (!known) changed = 1;
+                    drmModeFreePlane(plane);
+                    break;
+                }
+                drmModeFreePlane(plane);
+            }
+        }
+        if (encoder) drmModeFreeEncoder(encoder);
+        drmModeFreeConnector(connector);
+    }
+    drmModeFreeResources(resources);
+    drmModeFreePlaneResources(planes);
+    return changed || (active && active != capture.count);
+}
+
+/* После чтения кадра: нечитаемый выход (два снимка подряд, последний хороший не меньше CAPTURE_STUCK_RESTART_MS назад) или смена выходов - перезапуск. */
+static void check_outputs(void)
+{
+    static long long last_probe = 0;
+    long long now = kmsvnc_now_ns();
+    int attention = 0;
+    for (int n = 0; n < capture.count; n++) {
+        struct captured_output *out = &capture.outputs[n];
+        if (out->failures >= 2 && now - out->last_good >= CAPTURE_STUCK_RESTART_MS * KMSVNC_NS_IN_MS) {
+            char reason[200];
+            snprintf(reason, sizeof(reason), "output %s cannot be read: %s", out->name,
+                frame_error[0] ? frame_error : "unknown reason");
+            kmsvnc_restart(reason);
+        }
+        if (out->failures || now - out->last_fb >= SCREEN_OFF_BLANK_MS * KMSVNC_NS_IN_MS) attention = 1;
+    }
+    if (attention && now - last_probe >= 1000 * KMSVNC_NS_IN_MS) {
+        last_probe = now;
+        if (outputs_changed()) kmsvnc_restart("the set of active outputs changed");
+    }
 }
 
 /* Render node устройства (как у VAAPI), иначе сама карта, но с правом записи. */
@@ -345,7 +450,7 @@ int egl_capture_init(int own_device)
     /*
      * Контекст без поверхности, конфигурация нужна только для его создания.
      * У Mesa на платформе GBM конфигураций pbuffer нет, поэтому вторая
-     * попытка — любая конфигурация GLES2 (маска 0 подходит всем).
+     * попытка - любая конфигурация GLES2 (маска 0 подходит всем).
      */
     EGLint config_attributes[] = {
         EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
@@ -402,8 +507,9 @@ void egl_capture_frame(const char *unused, int width, int height, char *output)
     if (capture.count == 1 && !capture.outputs[0].pixels) {
         /* При ошибке в output остаётся прошлый снимок. */
         failed = read_output(&capture.outputs[0], output);
-        if (failed && !capture.failed) fprintf(stderr, "EGL DMA-BUF frame read failed; preserving the last frame\n");
+        if (failed && !capture.failed) fprintf(stderr, "EGL DMA-BUF frame read failed: %s; preserving the last frame\n", frame_error);
         capture.failed = failed;
+        check_outputs();
         return;
     }
     if (!capture.covered) memset(output, 0, (size_t)width * height * 4);
@@ -418,8 +524,9 @@ void egl_capture_frame(const char *unused, int width, int height, char *output)
                 memcpy(to + x * 4, from + (size_t)(x * (int64_t)out->native_width / out->width) * 4, 4);
         }
     }
-    if (failed && !capture.failed) fprintf(stderr, "EGL DMA-BUF frame read failed; preserving the last frame\n");
+    if (failed && !capture.failed) fprintf(stderr, "EGL DMA-BUF frame read failed: %s; preserving the last frame\n", frame_error);
     capture.failed = failed;
+    check_outputs();
 }
 
 static int output_count(rfbClientPtr client)
@@ -431,7 +538,7 @@ static rfbBool output_description(int index, rfbExtDesktopScreen *screen, rfbCli
 {
     if (index < 0 || index >= capture.count) return FALSE;
     const struct captured_output *out = &capture.outputs[index];
-    /* Клиенту с уменьшенным кадром (миниатюра, «живой» клиент) — его масштаб. */
+    /* Клиенту с уменьшенным кадром (миниатюра, «живой» клиент) - его масштаб. */
     int divisor = 1;
     if (client && client->scaledScreen && client->scaledScreen->width > 0 &&
         client->scaledScreen != client->screen) {

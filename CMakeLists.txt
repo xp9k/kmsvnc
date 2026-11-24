@@ -10,7 +10,7 @@ find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)
 pkg_search_module(LIBDRM REQUIRED libdrm)
 # libvncserver: пакет dno-tool встраивает закреплённую версию статически
-# (KMSVNC_LIBVNCSERVER_PREFIX — каталог её установки). Системная библиотека МОС 12
+# (KMSVNC_LIBVNCSERVER_PREFIX - каталог её установки). Системная библиотека МОС 12
 # и МОС 13 различается раскладкой структур под одним soname, а 0.9.13 теряет
 # буферы Zlib при каждом отключении клиента. Без префикса берётся системная
 # (только для локальной сборки).

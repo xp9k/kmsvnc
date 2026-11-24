@@ -11,3 +11,5 @@ void drm_cleanup();
 int drm_open();
 int drm_vendors();
 int drm_dump_cursor_plane(char **data, int *width, int *height);
+/* Перед каждым снимком: слежение за буфером экрана (VAAPI, mmap), чёрный кадр при выключенном экране. */
+void drm_follow_framebuffer(void);

@@ -27,7 +27,7 @@ struct kmsvnc_data *kmsvnc = NULL;
 
 /* Сторона плитки при сравнении кадров. */
 #define TILE_SIDE 64
-/* Без изменений и ввода дольше этого — редкая съёмка. */
+/* Без изменений и ввода дольше этого - редкая съёмка. */
 #define IDLE_AFTER_MS 1000
 #define IDLE_INTERVAL_MS 100
 /* Ожидание, когда снимать нечего (нет запросов, нет клиентов). */
@@ -49,6 +49,24 @@ static long long monotonic_ns(void)
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (long long)now.tv_sec * NS_IN_S + now.tv_nsec;
+}
+
+long long kmsvnc_now_ns(void)
+{
+    return monotonic_ns();
+}
+
+/*
+ * Захват не может продолжаться с текущими буферами (экран сменил режим или выходы): выйти, служба
+ * systemd запустит kmsvnc заново с новой геометрией. Без cleanup(): поток libvncserver ещё читает
+ * буферы, а ядро и так закроет uinput и DRM.
+ */
+void kmsvnc_restart(const char *reason)
+{
+    fprintf(stderr, "kmsvnc: %s; exiting so that the service restarts with the new screen geometry\n", reason);
+    fflush(stdout);
+    fflush(stderr);
+    _exit(75);
 }
 
 void capture_wakeup(int reason)
@@ -149,7 +167,7 @@ static void mark_region(sraRegionPtr *region, int x1, int y1, int x2, int y2)
 }
 
 /*
- * Перенести снимок в кадр сервера; 1 — что-то изменилось и отмечено.
+ * Перенести снимок в кадр сервера; 1 - что-то изменилось и отмечено.
  *
  * Сравнение плитками TILE_SIDE×TILE_SIDE: копируются и отмечаются только
  * изменённые плитки. Прежний общий прямоугольник от первого до последнего
@@ -695,7 +713,7 @@ int main(int argc, char **argv)
         /* Из простоя выводят ввод и новый клиент; запрос кадра только будит. */
         if (kicked & CAPTURE_WAKE_ACTIVITY) last_activity = now;
         /*
-         * Простой: экран не менялся и ввода не было дольше IDLE_AFTER_MS —
+         * Простой: экран не менялся и ввода не было дольше IDLE_AFTER_MS -
          * живые клиенты снимаются раз в IDLE_INTERVAL_MS, пока не придёт
          * ввод или не изменится экран. Запросы кадра простой не прерывают:
          * клиент миниатюр присылает их и без изменений экрана.
@@ -711,9 +729,16 @@ int main(int argc, char **argv)
             continue;
         }
         last_capture = now;
-        kmsvnc->drm->funcs->sync_start(kmsvnc->drm->prime_fd);
-        kmsvnc->drm->funcs->convert(kmsvnc->drm->mapped, kmsvnc->drm->mfb->width, kmsvnc->drm->mfb->height, kmsvnc->buf1);
-        kmsvnc->drm->funcs->sync_end(kmsvnc->drm->prime_fd);
+        drm_follow_framebuffer();
+        if (kmsvnc->drm->off_blank) {
+            /* Экран без буфера (выключен, смена сеанса): чёрный кадр, а не рабочий стол ушедшего пользователя. */
+            memset(kmsvnc->buf1, 0, buflen);
+        }
+        else {
+            kmsvnc->drm->funcs->sync_start(kmsvnc->drm->prime_fd);
+            kmsvnc->drm->funcs->convert(kmsvnc->drm->mapped, kmsvnc->drm->mfb->width, kmsvnc->drm->mfb->height, kmsvnc->buf1);
+            kmsvnc->drm->funcs->sync_end(kmsvnc->drm->prime_fd);
+        }
         long long captured = monotonic_ns();
         int tiles = 0;
         int changed = update_screen_buf(kmsvnc->buf, kmsvnc->buf1, kmsvnc->drm->mfb->width, kmsvnc->drm->mfb->height, &tiles);

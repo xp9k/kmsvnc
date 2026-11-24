@@ -5,6 +5,6 @@
 
 void va_cleanup();
 int va_init();
-/* Поверхность заново для текущего буфера экрана; 0 — успех. */
+/* Поверхность заново для текущего буфера экрана; 0 - успех. */
 int va_reimport(void);
 int va_hwframe_to_vaapi(char *out);
